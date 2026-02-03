@@ -4,6 +4,7 @@ import time
 import random
 import logging
 import traceback
+import shutil
 import gc
 import psutil
 from typing import List, Dict, Tuple
@@ -38,6 +39,9 @@ logger = setup_logging()
 
 DEFAULT_CONFIG = {
     "INPUT_DIR": "input_videos",
+    "PROCESSED_DIR": "processed_videos",
+    "FAILED_DIR": "failed_videos",
+
     "CLIP_DIR": "output/clips",
     "SUMMARY_DIR": "output/summary",
 
@@ -84,7 +88,13 @@ CFG = load_config()
 # SETUP
 # ==========================================================
 
-for d in [CFG["INPUT_DIR"], CFG["CLIP_DIR"], CFG["SUMMARY_DIR"]]:
+for d in [
+    CFG["INPUT_DIR"],
+    CFG["PROCESSED_DIR"],
+    CFG["FAILED_DIR"],
+    CFG["CLIP_DIR"],
+    CFG["SUMMARY_DIR"]
+]:
     os.makedirs(d, exist_ok=True)
 
 # ==========================================================
@@ -106,6 +116,18 @@ def is_valid_video(path: str) -> bool:
     ok, _ = cap.read()
     cap.release()
     return ok
+
+def move_video(src: str, dst_dir: str):
+    try:
+        base = os.path.basename(src)
+        dst = os.path.join(dst_dir, base)
+        if os.path.exists(dst):
+            name, ext = os.path.splitext(base)
+            dst = os.path.join(dst_dir, f"{name}_{int(time.time())}{ext}")
+        shutil.move(src, dst)
+        logger.info(f"📦 Video taşındı → {dst}")
+    except Exception as e:
+        logger.error(f"Video taşıma hatası: {e}")
 
 # ==========================================================
 # AUDIO
@@ -216,9 +238,9 @@ def select_clips(cands: List[Dict]) -> List[Dict]:
 
 def process_video(path: str) -> bool:
     name = os.path.basename(path)
-    logger.info(f"🎮 {name} başlandı")
-
+    logger.info(f"🎮 {name} başladı")
     video = None
+
     try:
         video = VideoFileClip(path)
         dur = video.duration
@@ -228,7 +250,7 @@ def process_video(path: str) -> bool:
         selected = select_clips(candidates)
 
         if not selected:
-            logger.warning("Klip yok")
+            logger.warning("Klip bulunamadı")
             return False
 
         outputs = []
@@ -253,7 +275,6 @@ def process_video(path: str) -> bool:
         for c in clips:
             c.close()
 
-        logger.info(f"✅ {name} tamamlandı")
         return True
 
     except Exception as e:
@@ -279,19 +300,26 @@ def main():
     ]
 
     if not files:
-        logger.warning("Geçerli video yok")
+        logger.warning("İşlenecek video yok")
         return
 
-    ok = 0
+    success = 0
+
     if CFG["PARALLEL"] and len(files) > 1:
         with ThreadPoolExecutor(max_workers=CFG["MAX_WORKERS"]) as ex:
-            for fut in as_completed([ex.submit(process_video, f) for f in files]):
-                ok += int(fut.result())
+            futures = {ex.submit(process_video, f): f for f in files}
+            for fut in as_completed(futures):
+                f = futures[fut]
+                ok = fut.result()
+                move_video(f, CFG["PROCESSED_DIR"] if ok else CFG["FAILED_DIR"])
+                success += int(ok)
     else:
         for f in files:
-            ok += int(process_video(f))
+            ok = process_video(f)
+            move_video(f, CFG["PROCESSED_DIR"] if ok else CFG["FAILED_DIR"])
+            success += int(ok)
 
-    logger.info(f"🏁 Bitti | Başarılı: {ok}/{len(files)} | Süre: {time.time()-start:.1f}s")
+    logger.info(f"🏁 Bitti | Başarılı: {success}/{len(files)} | Süre: {time.time()-start:.1f}s")
 
 if __name__ == "__main__":
     main()
