@@ -14,7 +14,7 @@ import numpy as np
 import librosa
 import cv2
 from scipy.signal import find_peaks
-from moviepy.editor import VideoFileClip, concatenate_videoclips
+from moviepy import VideoFileClip, concatenate_videoclips
 
 # ==========================================================
 # LOGGING
