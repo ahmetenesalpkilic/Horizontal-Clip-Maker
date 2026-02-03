@@ -55,7 +55,8 @@ DEFAULT_CONFIG = {
 
     "SPIKE_CLUSTER_WINDOW": 2.0,
     "MIN_EVENT_GAP": 25,
-    "MOTION_THRESHOLD": 18.0,
+
+    "MOTION_THRESHOLD": 8.0,   # 🔥 DÜŞÜRÜLDÜ
 
     "VIDEO_FORMATS": [".mp4", ".mkv", ".avi", ".mov"],
 
@@ -169,7 +170,7 @@ def motion_score(path: str, time_sec: float, window=1.0) -> float:
     ok, prev = cap.read()
     if not ok:
         cap.release()
-        return 0
+        return 0.0
 
     prev_g = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
     diffs = []
@@ -183,7 +184,7 @@ def motion_score(path: str, time_sec: float, window=1.0) -> float:
         prev_g = g
 
     cap.release()
-    return float(np.mean(diffs)) if diffs else 0
+    return float(np.mean(diffs)) if diffs else 0.0
 
 # ==========================================================
 # CLIPS
@@ -246,7 +247,15 @@ def process_video(path: str) -> bool:
         dur = video.duration
 
         spikes = cluster_spikes(detect_audio_spikes(path))
-        candidates = build_clips(spikes, path, dur) if spikes else fallback_clips(dur)
+        candidates = []
+
+        if spikes:
+            candidates = build_clips(spikes, path, dur)
+
+        if not spikes or not candidates:
+            logger.warning("Spike yok / motion düşük → fallback kullanılıyor")
+            candidates = fallback_clips(dur)
+
         selected = select_clips(candidates)
 
         if not selected:
@@ -257,8 +266,13 @@ def process_video(path: str) -> bool:
         for i, c in enumerate(selected, 1):
             clip = video.subclip(c["start"], c["end"])
             out = f"{CFG['CLIP_DIR']}/{name[:-4]}_{i}.mp4"
-            clip.write_videofile(out, codec="libx264", audio_codec="aac",
-                                 verbose=False, logger=None)
+            clip.write_videofile(
+                out,
+                codec="libx264",
+                audio_codec="aac",
+                verbose=False,
+                logger=None
+            )
             clip.close()
             outputs.append(out)
             check_memory()
@@ -267,8 +281,10 @@ def process_video(path: str) -> bool:
         summary = concatenate_videoclips(clips)
         summary.write_videofile(
             f"{CFG['SUMMARY_DIR']}/{name[:-4]}_HIGHLIGHTS.mp4",
-            codec="libx264", audio_codec="aac",
-            verbose=False, logger=None
+            codec="libx264",
+            audio_codec="aac",
+            verbose=False,
+            logger=None
         )
 
         summary.close()
@@ -293,6 +309,7 @@ def process_video(path: str) -> bool:
 
 def main():
     start = time.time()
+
     files = [
         os.path.join(CFG["INPUT_DIR"], f)
         for f in os.listdir(CFG["INPUT_DIR"])
@@ -319,7 +336,9 @@ def main():
             move_video(f, CFG["PROCESSED_DIR"] if ok else CFG["FAILED_DIR"])
             success += int(ok)
 
-    logger.info(f"🏁 Bitti | Başarılı: {success}/{len(files)} | Süre: {time.time()-start:.1f}s")
+    logger.info(
+        f"🏁 Bitti | Başarılı: {success}/{len(files)} | Süre: {time.time() - start:.1f}s"
+    )
 
 if __name__ == "__main__":
     main()
