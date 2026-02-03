@@ -1,289 +1,196 @@
 import os
+import shutil
 import json
 import time
-import random
 import logging
-import traceback
-import shutil
-import gc
-import psutil
-from typing import List, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import numpy as np
 import librosa
 import cv2
-from scipy.signal import find_peaks
-from moviepy import VideoFileClip, concatenate_videoclips
 
-# ==========================================================
+from moviepy.editor import VideoFileClip, concatenate_videoclips
+
+
+# =========================
 # LOGGING
-# ==========================================================
+# =========================
+LOG_FILE = "highlight_generator.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
 
-def setup_logging():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(message)s",
-        handlers=[
-            logging.FileHandler("highlight_generator.log", encoding="utf-8"),
-            logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger("HIGHLIGHT_ENGINE")
+# =========================
+# PATHS
+# =========================
+INPUT_DIR = Path("input_videos")
+OUTPUT_DIR = Path("output_clips")
+SUMMARY_DIR = Path("summary_videos")
+PROCESSED_DIR = Path("processed_videos")
+FAILED_DIR = Path("failed_videos")
 
-logger = setup_logging()
+for d in [INPUT_DIR, OUTPUT_DIR, SUMMARY_DIR, PROCESSED_DIR, FAILED_DIR]:
+    d.mkdir(exist_ok=True)
 
-# ==========================================================
+# =========================
 # CONFIG
-# ==========================================================
+# =========================
+CONFIG_PATH = "config.json"
 
 DEFAULT_CONFIG = {
-    "INPUT_DIR": "input_videos",
-    "PROCESSED_DIR": "processed_videos",
-    "FAILED_DIR": "failed_videos",
-
-    "CLIP_DIR": "output/clips",
-    "SUMMARY_DIR": "output/summary",
-
-    "PRE_MIN": 12,
-    "PRE_MAX": 20,
-    "POST_MIN": 20,
-    "POST_MAX": 30,
-
-    "MIN_CLIPS": 2,
-    "MAX_CLIPS": 7,
-
-    "SPIKE_CLUSTER_WINDOW": 2.0,
-    "MIN_EVENT_GAP": 25,
-
-    "MOTION_THRESHOLD": 8.0,   # 🔥 DÜŞÜRÜLDÜ
-
-    "VIDEO_FORMATS": [".mp4", ".mkv", ".avi", ".mov"],
-
-    "FALLBACK_ENABLED": True,
-    "FALLBACK_INTERVAL": 60,
-
-    "MAX_MEMORY_PERCENT": 80,
-    "PARALLEL": True,
-    "MAX_WORKERS": 4
+    "pre_min": 12,
+    "pre_max": 20,
+    "post_min": 20,
+    "post_max": 30,
+    "min_clips": 2,
+    "max_clips": 7,
+    "audio_cluster_sec": 2.0,
+    "motion_threshold": 15.0,
+    "audio_sensitivity": 1.8
 }
 
-def load_config(path="config.json") -> Dict:
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=4)
-        logger.info("Varsayılan config.json oluşturuldu")
-        return DEFAULT_CONFIG
+if not os.path.exists(CONFIG_PATH):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(DEFAULT_CONFIG, f, indent=4)
+    logging.info("Varsayılan config.json oluşturuldu")
 
-    with open(path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    CFG = json.load(f)
 
-    for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
 
-    return cfg
-
-CFG = load_config()
-
-# ==========================================================
-# SETUP
-# ==========================================================
-
-for d in [
-    CFG["INPUT_DIR"],
-    CFG["PROCESSED_DIR"],
-    CFG["FAILED_DIR"],
-    CFG["CLIP_DIR"],
-    CFG["SUMMARY_DIR"]
-]:
-    os.makedirs(d, exist_ok=True)
-
-# ==========================================================
-# UTILS
-# ==========================================================
-
-def check_memory():
-    p = psutil.Process(os.getpid())
-    mem = p.memory_percent()
-    if mem > CFG["MAX_MEMORY_PERCENT"]:
-        logger.warning(f"Yüksek bellek kullanımı: %{mem:.1f}")
-        gc.collect()
-
-def is_valid_video(path: str) -> bool:
-    ext = os.path.splitext(path)[1].lower()
-    if ext not in CFG["VIDEO_FORMATS"]:
-        return False
-    cap = cv2.VideoCapture(path)
-    ok, _ = cap.read()
-    cap.release()
-    return ok
-
-def move_video(src: str, dst_dir: str):
-    try:
-        base = os.path.basename(src)
-        dst = os.path.join(dst_dir, base)
-        if os.path.exists(dst):
-            name, ext = os.path.splitext(base)
-            dst = os.path.join(dst_dir, f"{name}_{int(time.time())}{ext}")
-        shutil.move(src, dst)
-        logger.info(f"📦 Video taşındı → {dst}")
-    except Exception as e:
-        logger.error(f"Video taşıma hatası: {e}")
-
-# ==========================================================
-# AUDIO
-# ==========================================================
-
-def detect_audio_spikes(path: str) -> List[Tuple[float, float]]:
+# =========================
+# AUDIO SPIKE DETECTION
+# =========================
+def detect_audio_spikes(path):
     y, sr = librosa.load(path, sr=None)
     rms = librosa.feature.rms(y=y)[0]
-    times = librosa.frames_to_time(range(len(rms)), sr=sr)
+    times = librosa.frames_to_time(np.arange(len(rms)), sr=sr)
 
-    med = np.median(rms)
-    mad = np.median(np.abs(rms - med))
-    threshold = med + 3 * mad
+    median = np.median(rms)
+    threshold = median * CFG["audio_sensitivity"]
 
-    peaks, props = find_peaks(rms, height=threshold)
-    return list(zip(times[peaks], props["peak_heights"]))
+    raw_spikes = times[rms > threshold]
 
-def cluster_spikes(spikes: List[Tuple[float, float]]) -> List[float]:
-    clusters, current = [], []
-    for t, v in spikes:
-        if not current or t - current[-1][0] <= CFG["SPIKE_CLUSTER_WINDOW"]:
-            current.append((t, v))
-        else:
-            clusters.append(max(current, key=lambda x: x[1]))
-            current = [(t, v)]
-    if current:
-        clusters.append(max(current, key=lambda x: x[1]))
-    return [c[0] for c in clusters]
+    # cluster spikes
+    clustered = []
+    for t in raw_spikes:
+        if not clustered or t - clustered[-1] > CFG["audio_cluster_sec"]:
+            clustered.append(t)
 
-# ==========================================================
-# MOTION
-# ==========================================================
+    return clustered
 
-def motion_score(path: str, time_sec: float, window=1.0) -> float:
-    cap = cv2.VideoCapture(path)
+
+# =========================
+# MOTION CHECK
+# =========================
+def has_motion(video_path, t, duration=1.0):
+    cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int((time_sec - window) * fps)))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(t * fps))
 
-    ok, prev = cap.read()
-    if not ok:
+    ret, prev = cap.read()
+    if not ret:
         cap.release()
-        return 0.0
+        return False
 
-    prev_g = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
     diffs = []
 
-    for _ in range(int(window * fps * 2)):
-        ok, frame = cap.read()
-        if not ok:
+    for _ in range(int(fps * duration)):
+        ret, frame = cap.read()
+        if not ret:
             break
-        g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        diffs.append(np.mean(cv2.absdiff(prev_g, g)))
-        prev_g = g
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        diffs.append(np.mean(cv2.absdiff(prev_gray, gray)))
+        prev_gray = gray
 
     cap.release()
-    return float(np.mean(diffs)) if diffs else 0.0
+    return np.mean(diffs) > CFG["motion_threshold"] if diffs else False
 
-# ==========================================================
-# CLIPS
-# ==========================================================
 
-def build_clips(events: List[float], path: str, dur: float) -> List[Dict]:
-    clips = []
-    for t in events:
-        m = motion_score(path, t)
-        if m < CFG["MOTION_THRESHOLD"]:
-            continue
+# =========================
+# BUILD CLIPS
+# =========================
+def build_clip_ranges(spikes, video_duration):
+    ranges = []
+    for t in spikes:
+        pre = np.random.uniform(CFG["pre_min"], CFG["pre_max"])
+        post = np.random.uniform(CFG["post_min"], CFG["post_max"])
 
-        pre = random.randint(CFG["PRE_MIN"], CFG["PRE_MAX"])
-        post = random.randint(CFG["POST_MIN"], CFG["POST_MAX"])
+        start = max(0, t - pre)
+        end = min(video_duration, t + post)
 
-        clips.append({
-            "time": t,
-            "start": max(0, t - pre),
-            "end": min(dur, t + post),
-            "score": m + post
-        })
-    return clips
+        if end - start >= 20:
+            ranges.append((start, end))
 
-def fallback_clips(dur: float) -> List[Dict]:
-    clips = []
-    step = CFG["FALLBACK_INTERVAL"]
-    for i in range(int(dur // step)):
-        t = (i + 1) * step
-        pre = random.randint(CFG["PRE_MIN"], CFG["PRE_MAX"])
-        post = random.randint(CFG["POST_MIN"], CFG["POST_MAX"])
-        clips.append({
-            "time": t,
-            "start": max(0, t - pre),
-            "end": min(dur, t + post),
-            "score": 50
-        })
-    return clips
+    return ranges[:CFG["max_clips"]]
 
-def select_clips(cands: List[Dict]) -> List[Dict]:
-    cands.sort(key=lambda x: x["score"], reverse=True)
-    sel = []
-    for c in cands:
-        if all(abs(c["time"] - s["time"]) > CFG["MIN_EVENT_GAP"] for s in sel):
-            sel.append(c)
-        if len(sel) >= CFG["MAX_CLIPS"]:
-            break
-    return sorted(sel[:max(CFG["MIN_CLIPS"], len(sel))], key=lambda x: x["start"])
 
-# ==========================================================
-# VIDEO PIPELINE
-# ==========================================================
-
-def process_video(path: str) -> bool:
-    name = os.path.basename(path)
-    logger.info(f"🎮 {name} başladı")
-    video = None
+# =========================
+# PROCESS VIDEO
+# =========================
+def process_video(video_path):
+    start_time = time.time()
+    logging.info(f"🎮 {video_path.name} başladı")
 
     try:
-        video = VideoFileClip(path)
-        dur = video.duration
+        video = VideoFileClip(str(video_path))
+        duration = video.duration
 
-        spikes = cluster_spikes(detect_audio_spikes(path))
-        candidates = []
+        spikes = detect_audio_spikes(str(video_path))
 
-        if spikes:
-            candidates = build_clips(spikes, path, dur)
+        valid_spikes = []
+        for t in spikes:
+            if has_motion(video_path, t):
+                valid_spikes.append(t)
 
-        if not spikes or not candidates:
-            logger.warning("Spike yok / motion düşük → fallback kullanılıyor")
-            candidates = fallback_clips(dur)
+        if not valid_spikes:
+            logging.warning("Spike yok / motion düşük → fallback kullanılıyor")
+            valid_spikes = [duration / 2]
 
-        selected = select_clips(candidates)
+        ranges = build_clip_ranges(valid_spikes, duration)
 
-        if not selected:
-            logger.warning("Klip bulunamadı")
-            return False
+        if len(ranges) < CFG["min_clips"]:
+            logging.warning("Yeterli klip bulunamadı")
+            raise RuntimeError("Klip bulunamadı")
 
-        outputs = []
-        for i, c in enumerate(selected, 1):
-            clip = video.subclip(c["start"], c["end"])
-            out = f"{CFG['CLIP_DIR']}/{name[:-4]}_{i}.mp4"
+        clips = []
+        clip_paths = []
+
+        for i, (s, e) in enumerate(ranges):
+            clip = video.subclip(s, e).without_audio()
+            out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}.mp4"
+
             clip.write_videofile(
-                out,
+                str(out),
                 codec="libx264",
-                audio_codec="aac",
-                verbose=False,
+                audio=False,
+                fps=30,
+                preset="ultrafast",
+                threads=1,
                 logger=None
             )
-            clip.close()
-            outputs.append(out)
-            check_memory()
 
-        clips = [VideoFileClip(p) for p in outputs]
-        summary = concatenate_videoclips(clips)
+            clip.close()
+            clips.append(VideoFileClip(str(out)))
+            clip_paths.append(out)
+
+        # SUMMARY VIDEO
+        summary = concatenate_videoclips(clips, method="compose").without_audio()
+        summary_out = SUMMARY_DIR / f"{video_path.stem}_SUMMARY.mp4"
+
         summary.write_videofile(
-            f"{CFG['SUMMARY_DIR']}/{name[:-4]}_HIGHLIGHTS.mp4",
+            str(summary_out),
             codec="libx264",
-            audio_codec="aac",
-            verbose=False,
+            audio=False,
+            fps=30,
+            preset="ultrafast",
+            threads=1,
             logger=None
         )
 
@@ -291,54 +198,38 @@ def process_video(path: str) -> bool:
         for c in clips:
             c.close()
 
-        return True
+        video.close()
+        shutil.move(str(video_path), PROCESSED_DIR / video_path.name)
+
+        logging.info(
+            f"✅ Tamamlandı | Klip: {len(ranges)} | Süre: {round(time.time()-start_time,1)}s"
+        )
 
     except Exception as e:
-        logger.error(f"{name} hata: {e}")
-        traceback.print_exc()
-        return False
-
-    finally:
-        if video:
+        logging.error(f"{video_path.name} hata: {e}", exc_info=True)
+        try:
             video.close()
-        gc.collect()
+        except:
+            pass
+        shutil.move(str(video_path), FAILED_DIR / video_path.name)
 
-# ==========================================================
+
+# =========================
 # MAIN
-# ==========================================================
-
+# =========================
 def main():
-    start = time.time()
-
-    files = [
-        os.path.join(CFG["INPUT_DIR"], f)
-        for f in os.listdir(CFG["INPUT_DIR"])
-        if is_valid_video(os.path.join(CFG["INPUT_DIR"], f))
-    ]
-
-    if not files:
-        logger.warning("İşlenecek video yok")
+    videos = list(INPUT_DIR.glob("*.mp4"))
+    if not videos:
+        logging.info("İşlenecek video yok")
         return
 
     success = 0
+    for v in videos:
+        process_video(v)
+        success += 1
 
-    if CFG["PARALLEL"] and len(files) > 1:
-        with ThreadPoolExecutor(max_workers=CFG["MAX_WORKERS"]) as ex:
-            futures = {ex.submit(process_video, f): f for f in files}
-            for fut in as_completed(futures):
-                f = futures[fut]
-                ok = fut.result()
-                move_video(f, CFG["PROCESSED_DIR"] if ok else CFG["FAILED_DIR"])
-                success += int(ok)
-    else:
-        for f in files:
-            ok = process_video(f)
-            move_video(f, CFG["PROCESSED_DIR"] if ok else CFG["FAILED_DIR"])
-            success += int(ok)
+    logging.info(f"🏁 Bitti | İşlenen video: {success}")
 
-    logger.info(
-        f"🏁 Bitti | Başarılı: {success}/{len(files)} | Süre: {time.time() - start:.1f}s"
-    )
 
 if __name__ == "__main__":
     main()
