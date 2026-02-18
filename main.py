@@ -1,4 +1,6 @@
 import os
+import whisper
+from transformers import pipeline
 import shutil
 import json
 import time
@@ -228,12 +230,43 @@ def process_video(video_path):
         ranges = build_clip_ranges(valid_spikes, duration)
 
         clips = []
+        # Speech-to-text ve başlık üretimi için modelleri yükle
+        try:
+            whisper_model = whisper.load_model("base")
+            summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+        except Exception as e:
+            logging.error(f"Model load error: {e}")
+            whisper_model = None
+            summarizer = None
+
         for i, (s, e) in enumerate(ranges):
             clip = video.subclip(s, e)
-            out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}.mp4"
-
+            temp_audio_path = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_audio.wav"
+            # Klipten sesi çıkar
+            clip.audio.write_audiofile(str(temp_audio_path), logger=None)
+            # Konuşma analizi ve başlık üretimi
+            transcript = ""
+            title = f"Clip {i+1}"
+            if whisper_model:
+                try:
+                    result = whisper_model.transcribe(str(temp_audio_path))
+                    transcript = result["text"]
+                except Exception as e:
+                    logging.error(f"Whisper error: {e}")
+            if summarizer and transcript:
+                try:
+                    summary = summarizer(transcript, max_length=60, min_length=10, do_sample=False)
+                    title = summary[0]["summary_text"]
+                except Exception as e:
+                    logging.error(f"Summarizer error: {e}")
+            # Başlığı dosya adına uygula
+            safe_title = "_".join(title.split())[:40]
+            out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_{safe_title}.mp4"
             clip.write_videofile(str(out), codec="libx264", fps=30, logger=None)
             clips.append(VideoFileClip(str(out)))
+            # Geçici ses dosyasını sil
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
 
         if clips:
             summary = create_smart_compilation(clips)
