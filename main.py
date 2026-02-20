@@ -244,26 +244,7 @@ def process_video(video_path):
         ranges = build_clip_ranges(valid_spikes, duration)
 
         clips = []
-        # Speech-to-text ve başlık üretimi için modelleri yükle
-        whisper_model = None
-        summarizer = None
-        try:
-            whisper_model = whisper.load_model("base")
-        except Exception as e:
-            logging.error(f"Whisper model load error: {e}")
-
-        def _load_summarizer():
-            try:
-                return pipeline("summarization", model="facebook/bart-large-cnn")
-            except Exception as e1:
-                logging.warning(f"Summarization pipeline failed: {e1}")
-                try:
-                    return pipeline("text2text-generation", model="t5-small")
-                except Exception as e2:
-                    logging.error(f"Fallback summarizer load error: {e2}")
-                    return None
-
-        summarizer = _load_summarizer()
+        logging.info(f"Processing video: {video_path.name}")
 
         def overlay_text(base_clip, text):
             if not text or base_clip.duration <= 0:
@@ -282,54 +263,94 @@ def process_video(video_path):
         for i, (s, e) in enumerate(ranges):
             clip = video.subclip(s, e)
             temp_audio_path = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_audio.wav"
-            # Klipten sesi çıkar
-            clip.audio.write_audiofile(str(temp_audio_path), logger=None)
-            # Konuşma analizi ve başlık üretimi
+            
+            # Extract audio
+            logging.info(f"Extracting audio for clip {i+1}...")
+            clip.audio.write_audiofile(str(temp_audio_path), logger=None, verbose=False)
+            
+            # Transcribe using Whisper
             transcript = ""
             title = f"Clip {i+1}"
-            if whisper_model:
+            
+            if GLOBAL_WHISPER_MODEL:
                 try:
-                    result = whisper_model.transcribe(str(temp_audio_path))
+                    logging.info(f"Transcribing audio for clip {i+1}...")
+                    result = GLOBAL_WHISPER_MODEL.transcribe(str(temp_audio_path))
                     transcript = result.get("text", "").strip()
+                    if transcript:
+                        logging.info(f"Transcript (clip {i+1}): {transcript[:100]}...")
+                    else:
+                        logging.warning(f"Clip {i+1}: No speech detected in audio.")
                 except Exception as e:
-                    logging.error(f"Whisper error: {e}")
-            if summarizer and transcript:
+                    logging.error(f"Whisper transcription failed for clip {i+1}: {e}")
+            else:
+                logging.warning(f"Whisper model not available for clip {i+1}")
+            
+            # Generate title from transcript
+            if GLOBAL_SUMMARIZER and transcript:
                 try:
-                    if hasattr(summarizer, "task") and summarizer.task == "text2text-generation":
-                        out = summarizer(f"summarize: {transcript}", max_length=60, min_length=10, do_sample=False)
+                    logging.info(f"Summarizing transcript for clip {i+1}...")
+                    if hasattr(GLOBAL_SUMMARIZER, "task") and GLOBAL_SUMMARIZER.task == "text2text-generation":
+                        out = GLOBAL_SUMMARIZER(f"summarize: {transcript}", max_length=60, min_length=10, do_sample=False)
                         title = out[0].get("generated_text", title)
                     else:
-                        out = summarizer(transcript, max_length=60, min_length=10, do_sample=False)
+                        out = GLOBAL_SUMMARIZER(transcript, max_length=60, min_length=10, do_sample=False)
                         title = out[0].get("summary_text", title)
+                    logging.info(f"Generated title for clip {i+1}: {title}")
                 except Exception as e:
-                    logging.error(f"Summarizer error: {e}")
-            logging.info(f"Clip {i+1} title: {title}")
-            # ---------- overlay title on clip ----------
+                    logging.error(f"Summarization failed for clip {i+1}: {e}")
+                    # Fallback: use first 50 chars of transcript
+                    if transcript:
+                        title = transcript[:50].strip()
+                        logging.info(f"Using transcript excerpt as title for clip {i+1}: {title}")
+            elif transcript:
+                # No summarizer, but we have transcript - use it as is (first ~50 chars)
+                title = transcript[:50].strip()
+                logging.info(f"No summarizer available; using transcript excerpt for clip {i+1}: {title}")
+            else:
+                # No transcript and no summarizer - use default
+                logging.warning(f"No transcript and no summarizer; using default title for clip {i+1}")
+            
+            # Ensure title is not empty
+            if not title or title.strip() == "":
+                title = f"Clip {i+1}"
+                logging.warning(f"Title was empty; using default: {title}")
+            
+            # Create safe filename
             safe_title = make_safe_filename(title) or f"clip_{i+1}"
+            logging.info(f"Safe filename for clip {i+1}: {safe_title}")
+            
+            # Overlay title on clip
             clip_with_title = overlay_text(clip, title)
 
             out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_{safe_title}.mp4"
-            # write the clip (with embedded title if available)
-            clip_with_title.write_videofile(str(out), codec="libx264", fps=30, logger=None)
+            logging.info(f"Writing clip {i+1} to: {out.name}")
+            clip_with_title.write_videofile(str(out), codec="libx264", fps=30, logger=None, verbose=False, audio_codec="aac")
             clips.append(VideoFileClip(str(out)))
-            # Geçici ses dosyasını sil
+            
+            # Clean up temp audio file
             if os.path.exists(temp_audio_path):
                 os.remove(temp_audio_path)
+                logging.info(f"Deleted temp audio: {temp_audio_path.name}")
 
         if clips:
+            logging.info(f"Creating summary video from {len(clips)} clips...")
             summary = create_smart_compilation(clips)
-            # add a simple overlay to the summary video
+            # add overlay to the summary video
             try:
                 summary = overlay_text(summary, f"Summary of {video_path.stem}")
             except Exception as e:
                 logging.error(f"Summary overlay error: {e}")
             summary_title = make_safe_filename(f"{video_path.stem}_SUMMARY")
             summary_out = SUMMARY_DIR / f"{summary_title}.mp4"
-            summary.write_videofile(str(summary_out), codec="libx264", fps=30, logger=None)
+            logging.info(f"Writing summary video to: {summary_out.name}")
+            summary.write_videofile(str(summary_out), codec="libx264", fps=30, logger=None, verbose=False, audio_codec="aac")
             summary.close()
+            logging.info(f"Summary video created successfully.")
 
         video.close()
         shutil.move(str(video_path), PROCESSED_DIR / video_path.name)
+        logging.info(f"Video {video_path.name} processed and moved to {PROCESSED_DIR.name}/")
 
         return True
 
@@ -341,7 +362,46 @@ def process_video(video_path):
 # =========================
 # MAIN
 # =========================
+
+# Global models - loaded once at startup
+GLOBAL_WHISPER_MODEL = None
+GLOBAL_SUMMARIZER = None
+
+def load_models():
+    """Load Whisper and summarizer models globally."""
+    global GLOBAL_WHISPER_MODEL, GLOBAL_SUMMARIZER
+    
+    try:
+        logging.info("Loading Whisper model...")
+        GLOBAL_WHISPER_MODEL = whisper.load_model("base")
+        logging.info("Whisper model loaded successfully.")
+    except Exception as e:
+        logging.error(f"Failed to load Whisper model: {e}")
+        GLOBAL_WHISPER_MODEL = None
+    
+    def _load_summarizer():
+        try:
+            logging.info("Loading summarizer (BART)...")
+            model = pipeline("summarization", model="facebook/bart-large-cnn")
+            logging.info("Summarizer (BART) loaded successfully.")
+            return model
+        except Exception as e1:
+            logging.warning(f"BART summarizer failed: {e1}, trying T5 fallback...")
+            try:
+                logging.info("Loading T5-small summarizer...")
+                model = pipeline("text2text-generation", model="t5-small")
+                logging.info("T5-small summarizer loaded successfully.")
+                return model
+            except Exception as e2:
+                logging.error(f"Failed to load fallback summarizer: {e2}")
+                return None
+    
+    GLOBAL_SUMMARIZER = _load_summarizer()
+
 def main():
+    # Load models at startup
+    load_models()
+    
     videos = list(INPUT_DIR.glob("*.mp4"))
     if not videos:
         logging.info("No videos found.")
