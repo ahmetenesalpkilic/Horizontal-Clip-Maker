@@ -1,5 +1,6 @@
 import os
 import re
+import warnings
 import whisper
 from transformers import pipeline
 import shutil
@@ -13,6 +14,10 @@ import multiprocessing
 import numpy as np
 import librosa
 import cv2
+
+# suppress common librosa warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="librosa")
+warnings.filterwarnings("ignore", category=FutureWarning, module="librosa")
 
 from moviepy.editor import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 from moviepy.video.fx.all import fadein, fadeout
@@ -240,13 +245,39 @@ def process_video(video_path):
 
         clips = []
         # Speech-to-text ve başlık üretimi için modelleri yükle
+        whisper_model = None
+        summarizer = None
         try:
             whisper_model = whisper.load_model("base")
-            summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
         except Exception as e:
-            logging.error(f"Model load error: {e}")
-            whisper_model = None
-            summarizer = None
+            logging.error(f"Whisper model load error: {e}")
+
+        def _load_summarizer():
+            try:
+                return pipeline("summarization", model="facebook/bart-large-cnn")
+            except Exception as e1:
+                logging.warning(f"Summarization pipeline failed: {e1}")
+                try:
+                    return pipeline("text2text-generation", model="t5-small")
+                except Exception as e2:
+                    logging.error(f"Fallback summarizer load error: {e2}")
+                    return None
+
+        summarizer = _load_summarizer()
+
+        def overlay_text(base_clip, text):
+            if not text or base_clip.duration <= 0:
+                return base_clip
+            try:
+                txt = (
+                    TextClip(text, fontsize=24, color="white", bg_color="black", size=(base_clip.w, None), method="caption")
+                    .set_duration(min(5, base_clip.duration))
+                    .set_position(("center", "top"))
+                )
+                return CompositeVideoClip([base_clip, txt])
+            except Exception as e:
+                logging.error(f"Text overlay error: {e}")
+                return base_clip
 
         for i, (s, e) in enumerate(ranges):
             clip = video.subclip(s, e)
@@ -264,28 +295,18 @@ def process_video(video_path):
                     logging.error(f"Whisper error: {e}")
             if summarizer and transcript:
                 try:
-                    summary = summarizer(transcript, max_length=60, min_length=10, do_sample=False)
-                    # pipeline returns a list of dicts
-                    title = summary[0].get("summary_text", title)
+                    if hasattr(summarizer, "task") and summarizer.task == "text2text-generation":
+                        out = summarizer(f"summarize: {transcript}", max_length=60, min_length=10, do_sample=False)
+                        title = out[0].get("generated_text", title)
+                    else:
+                        out = summarizer(transcript, max_length=60, min_length=10, do_sample=False)
+                        title = out[0].get("summary_text", title)
                 except Exception as e:
                     logging.error(f"Summarizer error: {e}")
             logging.info(f"Clip {i+1} title: {title}")
             # ---------- overlay title on clip ----------
             safe_title = make_safe_filename(title) or f"clip_{i+1}"
-            # create a text clip that lasts a few seconds at the start of the segment
-            if title and clip.duration > 0:
-                try:
-                    text_clip = (
-                        TextClip(title, fontsize=24, color="white", bg_color="black", size=(clip.w, None))
-                        .set_duration(min(5, clip.duration))
-                        .set_position(("center", "top"))
-                    )
-                    clip_with_title = CompositeVideoClip([clip, text_clip])
-                except Exception as e:
-                    logging.error(f"Text overlay error: {e}")
-                    clip_with_title = clip
-            else:
-                clip_with_title = clip
+            clip_with_title = overlay_text(clip, title)
 
             out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_{safe_title}.mp4"
             # write the clip (with embedded title if available)
@@ -299,12 +320,7 @@ def process_video(video_path):
             summary = create_smart_compilation(clips)
             # add a simple overlay to the summary video
             try:
-                text_clip = (
-                    TextClip(f"Summary of {video_path.stem}", fontsize=28, color="white", bg_color="black", size=(summary.w, None))
-                    .set_duration(min(5, summary.duration))
-                    .set_position(("center", "top"))
-                )
-                summary = CompositeVideoClip([summary, text_clip])
+                summary = overlay_text(summary, f"Summary of {video_path.stem}")
             except Exception as e:
                 logging.error(f"Summary overlay error: {e}")
             summary_title = make_safe_filename(f"{video_path.stem}_SUMMARY")
