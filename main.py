@@ -1,4 +1,5 @@
 import os
+import re
 import whisper
 from transformers import pipeline
 import shutil
@@ -13,7 +14,7 @@ import numpy as np
 import librosa
 import cv2
 
-from moviepy.editor import VideoFileClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, concatenate_videoclips, TextClip, CompositeVideoClip
 from moviepy.video.fx.all import fadein, fadeout
 
 
@@ -167,6 +168,14 @@ def has_motion(video_path, t, duration=1.0):
 # =========================
 # BUILD CLIPS
 # =========================
+def make_safe_filename(text: str, max_len: int = 40) -> str:
+    """Return a filesystem-safe version of *text* suitable for use in a file name."""
+    # replace whitespace with underscore, remove characters that are invalid in Windows filenames
+    safe = re.sub(r"[\\/:*?\"<>|]", "", text)
+    safe = "_".join(safe.split())
+    return safe[:max_len]
+
+
 def build_clip_ranges(spikes, duration):
     ranges = []
     for t in spikes:
@@ -250,19 +259,37 @@ def process_video(video_path):
             if whisper_model:
                 try:
                     result = whisper_model.transcribe(str(temp_audio_path))
-                    transcript = result["text"]
+                    transcript = result.get("text", "").strip()
                 except Exception as e:
                     logging.error(f"Whisper error: {e}")
             if summarizer and transcript:
                 try:
                     summary = summarizer(transcript, max_length=60, min_length=10, do_sample=False)
-                    title = summary[0]["summary_text"]
+                    # pipeline returns a list of dicts
+                    title = summary[0].get("summary_text", title)
                 except Exception as e:
                     logging.error(f"Summarizer error: {e}")
-            # Başlığı dosya adına uygula
-            safe_title = "_".join(title.split())[:40]
+            logging.info(f"Clip {i+1} title: {title}")
+            # ---------- overlay title on clip ----------
+            safe_title = make_safe_filename(title) or f"clip_{i+1}"
+            # create a text clip that lasts a few seconds at the start of the segment
+            if title and clip.duration > 0:
+                try:
+                    text_clip = (
+                        TextClip(title, fontsize=24, color="white", bg_color="black", size=(clip.w, None))
+                        .set_duration(min(5, clip.duration))
+                        .set_position(("center", "top"))
+                    )
+                    clip_with_title = CompositeVideoClip([clip, text_clip])
+                except Exception as e:
+                    logging.error(f"Text overlay error: {e}")
+                    clip_with_title = clip
+            else:
+                clip_with_title = clip
+
             out = OUTPUT_DIR / f"{video_path.stem}_clip_{i+1}_{safe_title}.mp4"
-            clip.write_videofile(str(out), codec="libx264", fps=30, logger=None)
+            # write the clip (with embedded title if available)
+            clip_with_title.write_videofile(str(out), codec="libx264", fps=30, logger=None)
             clips.append(VideoFileClip(str(out)))
             # Geçici ses dosyasını sil
             if os.path.exists(temp_audio_path):
@@ -270,7 +297,18 @@ def process_video(video_path):
 
         if clips:
             summary = create_smart_compilation(clips)
-            summary_out = SUMMARY_DIR / f"{video_path.stem}_SUMMARY.mp4"
+            # add a simple overlay to the summary video
+            try:
+                text_clip = (
+                    TextClip(f"Summary of {video_path.stem}", fontsize=28, color="white", bg_color="black", size=(summary.w, None))
+                    .set_duration(min(5, summary.duration))
+                    .set_position(("center", "top"))
+                )
+                summary = CompositeVideoClip([summary, text_clip])
+            except Exception as e:
+                logging.error(f"Summary overlay error: {e}")
+            summary_title = make_safe_filename(f"{video_path.stem}_SUMMARY")
+            summary_out = SUMMARY_DIR / f"{summary_title}.mp4"
             summary.write_videofile(str(summary_out), codec="libx264", fps=30, logger=None)
             summary.close()
 
